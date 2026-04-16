@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Spear Code</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body { background: #0a0e14; color: #c9d1d9; font-family: 'JetBrains Mono', monospace; }
+
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 10px; }
+  ::-webkit-scrollbar-thumb:hover { background: #4dd9c0; }
+
+  @keyframes spin        { to { transform: rotate(360deg); } }
+  @keyframes fadeUp      { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes pulse-dot   { 0%,100% { opacity:.3; transform:scale(.8); } 50% { opacity:1; transform:scale(1); } }
+  @keyframes blink-caret { 0%,100% { opacity:1; } 50% { opacity:0; } }
+  @keyframes status-in   { from { opacity:0; transform:translateX(-6px); } to { opacity:1; transform:translateX(0); } }
+
+  .msg-enter    { animation: fadeUp .2s ease forwards; }
+  .typing-dot   { width:7px; height:7px; border-radius:50%; background:#4dd9c0;
+                  display:inline-block; animation: pulse-dot 1.2s ease-in-out infinite; }
+  .typing-dot:nth-child(2) { animation-delay:.2s; }
+  .typing-dot:nth-child(3) { animation-delay:.4s; }
+  .server-tag   { animation: status-in .3s ease forwards; }
+
+  .msg-body pre  { background:#161b22; border:1px solid #21262d; border-radius:6px;
+                   padding:12px 14px; margin:8px 0; overflow-x:auto; font-size:12px; line-height:1.6; }
+  .msg-body code { font-family:'JetBrains Mono',monospace; font-size:12px; }
+  .msg-body p    { margin:4px 0; line-height:1.65; }
+
+  textarea:focus { outline: none; }
+  button { cursor:pointer; }
+
+  /* File viewer */
+  .file-code { white-space: pre; font-size: 12px; line-height: 1.7; tab-size: 4;
+               font-family: 'JetBrains Mono', monospace; }
+  .line-num  { display: inline-block; width: 3em; text-align: right; margin-right: 1em;
+               color: #484f58; user-select: none; flex-shrink: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script id="files-data" type="application/json">
+{"server.py": "\"\"\"\nspear_ai/server.py\n──────────────────\nProduction FastAPI server for SpearLLM.\n\nArchitecture decisions:\n  • Model loads ONCE at startup via lifespan context — zero per-request overhead\n  • Async request handlers — the CPU/GPU work is offloaded to a thread pool so\n    the event loop stays responsive for concurrent users\n  • Per-user conversation history stored in-memory (swap for Redis in prod)\n  • Streaming via Server-Sent Events (SSE) — same UX as ChatGPT\n  • API-key authentication via X-API-Key header (optional, env-controlled)\n  • Token-bucket rate limiting — fair use without a full Redis setup\n  • Structured JSON logging — easy to ship to Datadog / CloudWatch\n\nRun:\n  uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1\n\nIMPORTANT: Use --workers 1 when the model is on GPU to avoid duplicate VRAM\nusage. For CPU-only deployments you can use multiple workers.\n\"\"\"\n\nimport asyncio\nimport json\nimport logging\nimport os\nimport time\nimport uuid\nfrom collections import defaultdict\nfrom contextlib import asynccontextmanager\nfrom pathlib import Path\nfrom typing import AsyncGenerator\n\nimport torch\nfrom fastapi import Depends, FastAPI, Header, HTTPException, Request, status\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom fastapi.responses import StreamingResponse\nfrom pydantic import BaseModel, Field\n\nfrom model     import SpearLLM\nfrom tokenizer import SpearTokenizer\n\n\n# ─── Logging ─────────────────────────────────────────────────────────────────\n\nlogging.basicConfig(\n    level=logging.INFO,\n    format='{\"ts\":\"%(asctime)s\",\"level\":\"%(levelname)s\",\"msg\":\"%(message)s\"}',\n    datefmt=\"%Y-%m-%dT%H:%M:%SZ\",\n)\nlog = logging.getLogger(\"spear-server\")\n\n\n# ─── Config from environment ──────────────────────────────────────────────────\n\nMODEL_VERSION   = os.getenv(\"SPEAR_VERSION\",  \"l\")\nCHECKPOINT_PATH = os.getenv(\"SPEAR_CHECKPOINT\", f\"checkpoints/spear-{MODEL_VERSION}.pt\")\nTOKENIZER_PATH  = os.getenv(\"SPEAR_TOKENIZER\",  f\"checkpoints/spear-{MODEL_VERSION}.tok.json\")\n\n# API key auth: set SPEAR_API_KEY env var to enable, leave blank to disable\nAPI_KEY         = os.getenv(\"SPEAR_API_KEY\", \"\")\n\n# Generation defaults\nMAX_NEW_TOKENS  = int(os.getenv(\"SPEAR_MAX_TOKENS\",   \"200\"))\nTEMPERATURE     = float(os.getenv(\"SPEAR_TEMPERATURE\", \"0.8\"))\nTOP_P           = float(os.getenv(\"SPEAR_TOP_P\",       \"0.9\"))\n\n# Rate limiting: requests per minute per IP/key\nRATE_LIMIT_RPM  = int(os.getenv(\"SPEAR_RATE_LIMIT\",   \"30\"))\n\n# Max conversation turns kept in memory per user\nMAX_HISTORY     = int(os.getenv(\"SPEAR_MAX_HISTORY\",   \"10\"))\n\n\n# ─── Global state (loaded once at startup) ───────────────────────────────────\n\nclass ModelState:\n    model:      SpearLLM      | None = None\n    tokenizer:  SpearTokenizer| None = None\n    device:     str                  = \"cpu\"\n    loaded_at:  float                = 0.0\n    version:    str                  = \"\"\n\nSTATE = ModelState()\n\n# Per-user conversation history: { session_id: [(role, text), ...] }\nHISTORY: dict[str, list[dict]] = defaultdict(list)\n\n# Rate-limiter state: { key: [timestamp, ...] }\nRATE_BUCKETS: dict[str, list[float]] = defaultdict(list)\n\n\n# ─── Lifespan: load model once ────────────────────────────────────────────────\n\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n    \"\"\"Load model and tokeniser into memory at startup, clean up at shutdown.\"\"\"\n    log.info(\"Loading SpearLLM checkpoint…\")\n\n    if not Path(CHECKPOINT_PATH).exists():\n        log.warning(\n            f\"Checkpoint not found at '{CHECKPOINT_PATH}'. \"\n            \"Run train.py first, or set SPEAR_CHECKPOINT env var. \"\n            \"Server will start but /generate will return 503.\"\n        )\n    else:\n        # Choose device\n        if torch.cuda.is_available():\n            device = \"cuda\"\n        elif torch.backends.mps.is_available():\n            device = \"mps\"\n        else:\n            device = \"cpu\"\n\n        t0 = time.time()\n        STATE.model     = SpearLLM.load(CHECKPOINT_PATH, device=device)\n        STATE.tokenizer = SpearTokenizer.load(TOKENIZER_PATH)\n        STATE.device    = device\n        STATE.loaded_at = time.time()\n        STATE.version   = MODEL_VERSION\n\n        elapsed = time.time() - t0\n        log.info(\n            f\"SpearLLM-{MODEL_VERSION.upper()} loaded on {device} \"\n            f\"in {elapsed:.2f}s | {STATE.model.param_count()} params\"\n        )\n\n    yield  # ── server runs ──\n\n    log.info(\"Shutting down SpearLLM server.\")\n    STATE.model = None\n\n\n# ─── App ──────────────────────────────────────────────────────────────────────\n\napp = FastAPI(\n    title=\"Spear AI API\",\n    version=\"2.0.0\",\n    description=\"Central inference server for SpearLLM. Train once, serve many.\",\n    lifespan=lifespan,\n)\n\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=[\"*\"],          # Restrict in production to your domain\n    allow_methods=[\"GET\", \"POST\"],\n    allow_headers=[\"*\"],\n)\n\n\n# ─── Auth ─────────────────────────────────────────────────────────────────────\n\ndef require_api_key(x_api_key: str = Header(default=\"\")):\n    \"\"\"Validate API key if SPEAR_API_KEY env var is set.\"\"\"\n    if API_KEY and x_api_key != API_KEY:\n        raise HTTPException(\n            status_code=status.HTTP_401_UNAUTHORIZED,\n            detail=\"Invalid or missing API key. Pass it in the X-API-Key header.\",\n        )\n    return x_api_key\n\n\n# ─── Rate limiting ────────────────────────────────────────────────────────────\n\ndef check_rate_limit(request: Request, api_key: str = Depends(require_api_key)):\n    \"\"\"Simple token-bucket rate limiter keyed on IP address (or API key).\"\"\"\n    key = api_key or request.client.host\n    now = time.time()\n    window_start = now - 60.0\n\n    # Remove old timestamps\n    RATE_BUCKETS[key] = [t for t in RATE_BUCKETS[key] if t > window_start]\n\n    if len(RATE_BUCKETS[key]) >= RATE_LIMIT_RPM:\n        raise HTTPException(\n            status_code=status.HTTP_429_TOO_MANY_REQUESTS,\n            detail=f\"Rate limit exceeded. Max {RATE_LIMIT_RPM} requests per minute.\",\n        )\n\n    RATE_BUCKETS[key].append(now)\n    return key\n\n\n# ─── Schemas ──────────────────────────────────────────────────────────────────\n\nclass GenerateRequest(BaseModel):\n    prompt:      str   = Field(...,  min_length=1, max_length=4096)\n    session_id:  str   = Field(default_factory=lambda: str(uuid.uuid4()))\n    max_tokens:  int   = Field(default=MAX_NEW_TOKENS, ge=1, le=500)\n    temperature: float = Field(default=TEMPERATURE,    ge=0.0, le=2.0)\n    top_p:       float = Field(default=TOP_P,          ge=0.0, le=1.0)\n    stream:      bool  = Field(default=False)\n\n\nclass GenerateResponse(BaseModel):\n    response:   str\n    session_id: str\n    tokens:     int\n    latency_ms: int\n    model:      str\n\n\nclass HealthResponse(BaseModel):\n    status:     str\n    model:      str | None\n    device:     str\n    params:     str | None\n    uptime_s:   float\n\n\n# ─── Core inference function ──────────────────────────────────────────────────\n\ndef _build_context(session_id: str, prompt: str) -> str:\n    \"\"\"\n    Prepend recent conversation history to the prompt so the model has context.\n    This is NOT retraining — we're just providing context in the input.\n    \"\"\"\n    history = HISTORY[session_id][-MAX_HISTORY:]\n    parts = []\n    for turn in history:\n        role = \"User\" if turn[\"role\"] == \"user\" else \"SpearLLM\"\n        parts.append(f\"{role}: {turn['content']}\")\n    parts.append(f\"User: {prompt}\")\n    parts.append(\"SpearLLM:\")\n    return \"\\n\".join(parts)\n\n\ndef _run_inference(req: GenerateRequest) -> tuple[str, int]:\n    \"\"\"\n    Blocking inference call. Run in a thread pool so the event loop stays free.\n    Returns (response_text, token_count).\n    \"\"\"\n    if STATE.model is None:\n        raise RuntimeError(\"Model not loaded\")\n\n    context = _build_context(req.session_id, req.prompt)\n    ids     = STATE.tokenizer.encode(context, add_bos=True)\n\n    # Trim to context window\n    cfg = STATE.model.cfg\n    if len(ids) > cfg.ctx_len:\n        ids = ids[-cfg.ctx_len:]\n\n    all_ids   = STATE.model.generate(\n        ids,\n        max_new=req.max_tokens,\n        temperature=req.temperature,\n        top_p=req.top_p,\n    )\n    new_ids   = all_ids[len(ids):]\n    response  = STATE.tokenizer.decode(new_ids)\n\n    # ── Update conversation history ───────────────────────────────────────────\n    HISTORY[req.session_id].append({\"role\": \"user\",      \"content\": req.prompt})\n    HISTORY[req.session_id].append({\"role\": \"assistant\", \"content\": response})\n\n    # Cap history size\n    if len(HISTORY[req.session_id]) > MAX_HISTORY * 2:\n        HISTORY[req.session_id] = HISTORY[req.session_id][-MAX_HISTORY * 2:]\n\n    return response, len(new_ids)\n\n\n# ─── Endpoints ────────────────────────────────────────────────────────────────\n\n@app.get(\"/health\", response_model=HealthResponse)\nasync def health():\n    \"\"\"Returns server health and model status. No auth required.\"\"\"\n    return {\n        \"status\":   \"ok\" if STATE.model else \"no_model\",\n        \"model\":    f\"SpearLLM-{STATE.version.upper()}\" if STATE.version else None,\n        \"device\":   STATE.device,\n        \"params\":   STATE.model.param_count() if STATE.model else None,\n        \"uptime_s\": round(time.time() - STATE.loaded_at, 1) if STATE.loaded_at else 0,\n    }\n\n\n@app.post(\"/generate\", response_model=GenerateResponse)\nasync def generate(\n    req:      GenerateRequest,\n    _rate_ok: str = Depends(check_rate_limit),\n):\n    \"\"\"\n    Main inference endpoint.\n    - POST { \"prompt\": \"...\", \"session_id\": \"...\", \"stream\": false }\n    - Returns { \"response\": \"...\", \"session_id\": \"...\", ... }\n\n    Set stream: true to receive a text/event-stream (SSE) instead.\n    \"\"\"\n    if STATE.model is None:\n        raise HTTPException(\n            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,\n            detail=\"Model not loaded. Run train.py first.\",\n        )\n\n    if req.stream:\n        return StreamingResponse(\n            _stream_tokens(req),\n            media_type=\"text/event-stream\",\n            headers={\n                \"Cache-Control\": \"no-cache\",\n                \"X-Accel-Buffering\": \"no\",  # Disable nginx buffering\n            },\n        )\n\n    # ── Non-streaming: run inference in thread pool ───────────────────────────\n    t0 = time.time()\n    try:\n        loop     = asyncio.get_running_loop()\n        response, n_tokens = await loop.run_in_executor(\n            None, _run_inference, req\n        )\n    except Exception as e:\n        log.error(f\"Inference error: {e}\")\n        raise HTTPException(status_code=500, detail=str(e))\n\n    latency = int((time.time() - t0) * 1000)\n    log.info(f\"session={req.session_id[:8]} tokens={n_tokens} latency={latency}ms\")\n\n    return {\n        \"response\":   response,\n        \"session_id\": req.session_id,\n        \"tokens\":     n_tokens,\n        \"latency_ms\": latency,\n        \"model\":      f\"SpearLLM-{STATE.version.upper()}\",\n    }\n\n\nasync def _stream_tokens(req: GenerateRequest) -> AsyncGenerator[str, None]:\n    \"\"\"\n    Server-Sent Events generator for streaming token-by-token output.\n    The model generates all tokens at once then we yield them one-by-one —\n    swap for a true streaming generate() in a future version.\n    \"\"\"\n    try:\n        loop = asyncio.get_running_loop()\n        response, n_tokens = await loop.run_in_executor(None, _run_inference, req)\n    except Exception as e:\n        yield f\"data: {json.dumps({'error': str(e)})}\\n\\n\"\n        return\n\n    words = response.split(\" \")\n    for i, word in enumerate(words):\n        chunk = word + (\" \" if i < len(words) - 1 else \"\")\n        payload = json.dumps({\"token\": chunk, \"done\": False, \"session_id\": req.session_id})\n        yield f\"data: {payload}\\n\\n\"\n        await asyncio.sleep(0.02)  # ~50 tokens/s apparent rate\n\n    # Send done signal\n    yield f\"data: {json.dumps({'token': '', 'done': True, 'tokens': n_tokens})}\\n\\n\"\n\n\n@app.delete(\"/session/{session_id}\")\nasync def clear_session(\n    session_id: str,\n    _rate_ok:   str = Depends(check_rate_limit),\n):\n    \"\"\"Clear conversation history for a session.\"\"\"\n    if session_id in HISTORY:\n        del HISTORY[session_id]\n    return {\"cleared\": session_id}\n\n\n@app.get(\"/sessions\")\nasync def list_sessions(_rate_ok: str = Depends(check_rate_limit)):\n    \"\"\"List active session IDs and their turn counts (admin / debug).\"\"\"\n    return {\n        sid: len(turns) // 2\n        for sid, turns in HISTORY.items()\n    }\n", "model.py": "\"\"\"\nspear_ai/model.py\n─────────────────\nPyTorch implementation of SpearLLM — a GPT-style transformer that mirrors the\nbrowser-side architecture exactly so weights trained here load cleanly into the\nserver (and vice-versa if you ever export from the browser).\n\nArchitecture choices (matching browser):\n  • RMSNorm      — lighter than LayerNorm, no mean subtraction\n  • RoPE          — rotary positional encoding, applied per-head\n  • SwiGLU        — gated feedforward (two parallel projections + SiLU gate)\n  • Tied embeddings — input/output share the same weight matrix\n  • No bias terms  — keeps parameter count clean\n\"\"\"\n\nimport math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom dataclasses import dataclass\nfrom typing import Optional\n\n\n# ─── Config ──────────────────────────────────────────────────────────────────\n\n@dataclass\nclass SpearConfig:\n    # Model size (must match the checkpoint that is loaded)\n    version:    str   = \"s\"\n    vocab_size: int   = 4096\n    n_layers:   int   = 8\n    n_heads:    int   = 8\n    d_model:    int   = 512\n    ctx_len:    int   = 96\n\n    # Derived — set automatically in __post_init__\n    d_head:  int = 0\n    d_ff:    int = 0\n\n    def __post_init__(self):\n        self.d_head = self.d_model // self.n_heads\n        # SwiGLU hidden dim: 8/3 × d_model rounded to nearest 64\n        self.d_ff = round(self.d_model * 8 / 3 / 64) * 64\n\n    @classmethod\n    def from_version(cls, version: str) -> \"SpearConfig\":\n        \"\"\"Return the preset config that matches the browser VERSION_CONFIGS.\"\"\"\n        presets = {\n            \"s\":  dict(n_layers=8,  n_heads=8,  d_model=512,  ctx_len=96),\n            \"m\":  dict(n_layers=16, n_heads=16, d_model=1024, ctx_len=96),\n            \"l\":  dict(n_layers=24, n_heads=16, d_model=1024, ctx_len=128),\n            \"xl\": dict(n_layers=32, n_heads=16, d_model=1024, ctx_len=128),\n        }\n        if version not in presets:\n            raise ValueError(f\"Unknown version '{version}'. Choose from: {list(presets)}\")\n        return cls(version=version, **presets[version])\n\n\n# ─── Building Blocks ─────────────────────────────────────────────────────────\n\nclass RMSNorm(nn.Module):\n    \"\"\"Root-mean-square normalisation (no learnable bias).\"\"\"\n    def __init__(self, dim: int, eps: float = 1e-6):\n        super().__init__()\n        self.eps = eps\n        self.weight = nn.Parameter(torch.ones(dim))\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        # x: (B, T, D)\n        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()\n        return (x.float() * rms).to(x.dtype) * self.weight\n\n\ndef build_rope_cache(ctx_len: int, d_head: int, device: torch.device) -> tuple:\n    \"\"\"Precompute cos/sin tables for RoPE.\"\"\"\n    half = d_head // 2\n    positions = torch.arange(ctx_len, device=device).float()\n    freqs     = torch.arange(half,    device=device).float()\n    theta     = 1.0 / (10000.0 ** (2 * freqs / d_head))          # (half,)\n    angles    = torch.outer(positions, theta)                      # (ctx_len, half)\n    return angles.cos(), angles.sin()                              # each (ctx_len, half)\n\n\ndef apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:\n    \"\"\"\n    Apply rotary embeddings to query or key tensor.\n    x   : (B, n_heads, T, d_head)\n    cos : (T, d_head//2)\n    sin : (T, d_head//2)\n    \"\"\"\n    half = x.shape[-1] // 2\n    x1, x2 = x[..., :half], x[..., half:]\n    # cos/sin broadcast over (B, n_heads, T, half)\n    cos_ = cos[:x.shape[2]].unsqueeze(0).unsqueeze(0)\n    sin_ = sin[:x.shape[2]].unsqueeze(0).unsqueeze(0)\n    return torch.cat([x1 * cos_ - x2 * sin_,\n                      x1 * sin_ + x2 * cos_], dim=-1)\n\n\nclass SwiGLU(nn.Module):\n    \"\"\"Gated feedforward: two parallel linear projections + SiLU gate.\"\"\"\n    def __init__(self, d_model: int, d_ff: int):\n        super().__init__()\n        self.w1 = nn.Linear(d_model, d_ff, bias=False)   # gate proj\n        self.w3 = nn.Linear(d_model, d_ff, bias=False)   # value proj\n        self.w2 = nn.Linear(d_ff,   d_model, bias=False) # output proj\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.w2(F.silu(self.w1(x)) * self.w3(x))\n\n\nclass MultiHeadAttention(nn.Module):\n    \"\"\"Causal multi-head self-attention with RoPE.\"\"\"\n    def __init__(self, cfg: SpearConfig):\n        super().__init__()\n        self.n_heads = cfg.n_heads\n        self.d_head  = cfg.d_head\n        self.d_model = cfg.d_model\n\n        self.Wq = nn.Linear(cfg.d_model, cfg.n_heads * cfg.d_head, bias=False)\n        self.Wk = nn.Linear(cfg.d_model, cfg.n_heads * cfg.d_head, bias=False)\n        self.Wv = nn.Linear(cfg.d_model, cfg.n_heads * cfg.d_head, bias=False)\n        self.Wo = nn.Linear(cfg.n_heads * cfg.d_head, cfg.d_model, bias=False)\n\n    def forward(\n        self,\n        x:   torch.Tensor,\n        cos: torch.Tensor,\n        sin: torch.Tensor,\n        mask: Optional[torch.Tensor] = None,\n        kv_cache: Optional[dict]    = None,\n    ) -> tuple:\n        B, T, D = x.shape\n        H, Dh   = self.n_heads, self.d_head\n\n        q = self.Wq(x).view(B, T, H, Dh).transpose(1, 2)  # (B,H,T,Dh)\n        k = self.Wk(x).view(B, T, H, Dh).transpose(1, 2)\n        v = self.Wv(x).view(B, T, H, Dh).transpose(1, 2)\n\n        q = apply_rope(q, cos, sin)\n        k = apply_rope(k, cos, sin)\n\n        # KV-cache: append current k/v and use full sequence for attention\n        if kv_cache is not None:\n            if \"k\" in kv_cache:\n                k = torch.cat([kv_cache[\"k\"], k], dim=2)\n                v = torch.cat([kv_cache[\"v\"], v], dim=2)\n            kv_cache[\"k\"] = k\n            kv_cache[\"v\"] = v\n\n        # Scaled dot-product attention (uses Flash Attention if available)\n        scale = math.sqrt(Dh)\n        attn  = torch.matmul(q, k.transpose(-2, -1)) / scale  # (B,H,T,S)\n\n        if mask is not None:\n            attn = attn + mask[:, :, :T, :k.shape[2]]\n\n        attn = F.softmax(attn.float(), dim=-1).to(x.dtype)\n        out  = torch.matmul(attn, v)                            # (B,H,T,Dh)\n        out  = out.transpose(1, 2).contiguous().view(B, T, H * Dh)\n        return self.Wo(out), kv_cache\n\n\nclass TransformerBlock(nn.Module):\n    def __init__(self, cfg: SpearConfig):\n        super().__init__()\n        self.norm_attn = RMSNorm(cfg.d_model)\n        self.attn      = MultiHeadAttention(cfg)\n        self.norm_ffn  = RMSNorm(cfg.d_model)\n        self.ffn       = SwiGLU(cfg.d_model, cfg.d_ff)\n\n    def forward(\n        self,\n        x:        torch.Tensor,\n        cos:      torch.Tensor,\n        sin:      torch.Tensor,\n        mask:     Optional[torch.Tensor] = None,\n        kv_cache: Optional[dict]         = None,\n    ) -> tuple:\n        # Pre-norm residual — attention\n        attn_out, kv_cache = self.attn(self.norm_attn(x), cos, sin, mask, kv_cache)\n        x = x + attn_out\n        # Pre-norm residual — feedforward\n        x = x + self.ffn(self.norm_ffn(x))\n        return x, kv_cache\n\n\n# ─── Full Model ───────────────────────────────────────────────────────────────\n\nclass SpearLLM(nn.Module):\n    \"\"\"\n    Full SpearLLM model. Weight names are kept identical to the browser\n    implementation so checkpoints are interchangeable.\n    \"\"\"\n    def __init__(self, cfg: SpearConfig):\n        super().__init__()\n        self.cfg     = cfg\n        self.E       = nn.Embedding(cfg.vocab_size, cfg.d_model)   # token embed\n        self.blocks  = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])\n        self.g_final = RMSNorm(cfg.d_model)\n        # Output projection shares weights with embedding (weight tying)\n        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)\n        self.lm_head.weight = self.E.weight\n\n        # Precompute causal mask\n        mask = torch.full((cfg.ctx_len, cfg.ctx_len), float(\"-inf\")).triu(1)\n        self.register_buffer(\"causal_mask\", mask.unsqueeze(0).unsqueeze(0))\n\n        # RoPE tables\n        cos, sin = build_rope_cache(cfg.ctx_len, cfg.d_head, torch.device(\"cpu\"))\n        self.register_buffer(\"rope_cos\", cos)\n        self.register_buffer(\"rope_sin\", sin)\n\n        self._init_weights()\n\n    def _init_weights(self):\n        nn.init.normal_(self.E.weight, std=math.sqrt(1 / self.cfg.d_model))\n        for block in self.blocks:\n            nn.init.normal_(block.attn.Wq.weight, std=0.02)\n            nn.init.normal_(block.attn.Wk.weight, std=0.02)\n            nn.init.normal_(block.attn.Wv.weight, std=0.02)\n            nn.init.normal_(block.attn.Wo.weight, std=0.02 / math.sqrt(2 * self.cfg.n_layers))\n            nn.init.normal_(block.ffn.w1.weight,  std=0.02)\n            nn.init.normal_(block.ffn.w3.weight,  std=0.02)\n            nn.init.normal_(block.ffn.w2.weight,  std=0.02 / math.sqrt(2 * self.cfg.n_layers))\n\n    # ── Forward pass (training) ───────────────────────────────────────────────\n    def forward(self, idx: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        idx : (B, T) — token indices\n        returns logits (B, T, vocab_size)\n        \"\"\"\n        B, T = idx.shape\n        x    = self.E(idx)\n        cos  = self.rope_cos[:T]\n        sin  = self.rope_sin[:T]\n\n        for block in self.blocks:\n            x, _ = block(x, cos, sin, self.causal_mask)\n\n        return self.lm_head(self.g_final(x))\n\n    # ── Autoregressive generation ─────────────────────────────────────────────\n    @torch.inference_mode()\n    def generate(\n        self,\n        prompt_ids:   list[int],\n        max_new:      int   = 200,\n        temperature:  float = 0.8,\n        top_p:        float = 0.9,\n        repetition_penalty: float = 1.1,\n    ) -> list[int]:\n        \"\"\"\n        Greedy / top-p sampling with KV-caching for fast autoregressive decode.\n        Returns the full sequence (prompt + generated tokens).\n        \"\"\"\n        device = next(self.parameters()).device\n        ids    = list(prompt_ids)\n        kv_caches = [{} for _ in self.blocks]\n\n        # ── Prefill: process the full prompt in one shot ──────────────────────\n        if len(ids) > 0:\n            ctx = ids[-self.cfg.ctx_len:]\n            x   = self.E(torch.tensor([ctx], device=device))\n            cos = self.rope_cos[:len(ctx)]\n            sin = self.rope_sin[:len(ctx)]\n            for i, block in enumerate(self.blocks):\n                x, kv_caches[i] = block(x, cos, sin, self.causal_mask, kv_caches[i])\n            logits = self.lm_head(self.g_final(x))[:, -1, :]  # (1, V)\n        else:\n            raise ValueError(\"prompt_ids must not be empty\")\n\n        generated = []\n\n        for step in range(max_new):\n            # ── Apply repetition penalty ──────────────────────────────────────\n            if repetition_penalty != 1.0:\n                for tid in set(ids + generated):\n                    logits[0, tid] /= repetition_penalty\n\n            # ── Sample ───────────────────────────────────────────────────────\n            if temperature == 0:\n                next_id = logits.argmax(-1).item()\n            else:\n                probs = F.softmax(logits[0] / temperature, dim=-1)\n                # Top-p (nucleus) filtering\n                sorted_probs, sorted_idx = torch.sort(probs, descending=True)\n                cumsum = sorted_probs.cumsum(0)\n                cutoff = (cumsum - sorted_probs) > top_p\n                sorted_probs[cutoff] = 0\n                sorted_probs /= sorted_probs.sum()\n                next_id = sorted_idx[torch.multinomial(sorted_probs, 1)].item()\n\n            generated.append(next_id)\n\n            # ── Decode one new token with KV-cache ────────────────────────────\n            x   = self.E(torch.tensor([[next_id]], device=device))\n            pos = len(ctx) + step\n            cos = self.rope_cos[pos:pos+1]\n            sin = self.rope_sin[pos:pos+1]\n            for i, block in enumerate(self.blocks):\n                x, kv_caches[i] = block(x, cos, sin, None, kv_caches[i])\n            logits = self.lm_head(self.g_final(x))[:, -1, :]\n\n        return ids + generated\n\n    # ── Persistence ───────────────────────────────────────────────────────────\n    def save(self, path: str):\n        torch.save({\"config\": self.cfg.__dict__, \"state_dict\": self.state_dict()}, path)\n        print(f\"✓ Saved checkpoint → {path}\")\n\n    @classmethod\n    def load(cls, path: str, device: str = \"cpu\") -> \"SpearLLM\":\n        ckpt   = torch.load(path, map_location=device, weights_only=False)\n        cfg    = SpearConfig(**ckpt[\"config\"])\n        model  = cls(cfg)\n        model.load_state_dict(ckpt[\"state_dict\"])\n        model.eval()\n        return model.to(device)\n\n    def param_count(self) -> str:\n        n = sum(p.numel() for p in self.parameters())\n        return f\"{n/1e6:.1f}M\"\n", "tokenizer.py": "\"\"\"\nspear_ai/tokenizer.py\n─────────────────────\nLightweight character-level tokenizer that mirrors what the browser version\nbuilds on-the-fly from training text.\n\nDesign:\n  • Vocabulary is built from the training corpus (max VOCAB_TARGET=4096 tokens)\n  • Special tokens: <pad>=0, <unk>=1, <bos>=2, <eos>=3\n  • Everything else: word-level tokens sorted by frequency, with single\n    characters as the fallback vocabulary\n  • Serialises to / loads from a plain JSON file so no external dependencies\n\"\"\"\n\nimport json\nimport re\nfrom collections import Counter\nfrom pathlib import Path\n\n\nSPECIAL = {\"<pad>\": 0, \"<unk>\": 1, \"<bos>\": 2, \"<eos>\": 3}\nPAD_ID  = 0\nUNK_ID  = 1\nBOS_ID  = 2\nEOS_ID  = 3\n\n\ndef _tokenise_text(text: str) -> list[str]:\n    \"\"\"Split on whitespace boundaries, keeping punctuation as separate tokens.\"\"\"\n    return re.findall(r\"\\w+|[^\\w\\s]\", text.lower())\n\n\nclass SpearTokenizer:\n    def __init__(self, vocab: dict[str, int] | None = None):\n        self.vocab:   dict[str, int] = vocab or {}\n        self.id2tok:  dict[int, str] = {v: k for k, v in self.vocab.items()}\n\n    # ── Build from corpus ────────────────────────────────────────────────────\n    @classmethod\n    def from_text(cls, text: str, max_vocab: int = 4096) -> \"SpearTokenizer\":\n        tokens  = _tokenise_text(text)\n        counts  = Counter(tokens)\n\n        vocab: dict[str, int] = dict(SPECIAL)  # start with special tokens\n\n        # 1. Most frequent words\n        for word, _ in counts.most_common(max_vocab - len(SPECIAL) - 128):\n            if word not in vocab:\n                vocab[word] = len(vocab)\n\n        # 2. Fill remainder with individual characters (ensures coverage)\n        for ch in sorted(set(text)):\n            if len(vocab) >= max_vocab:\n                break\n            if ch not in vocab:\n                vocab[ch] = len(vocab)\n\n        inst = cls(vocab)\n        print(f\"✓ Built vocabulary: {len(vocab)} tokens\")\n        return inst\n\n    # ── Encode / Decode ──────────────────────────────────────────────────────\n    def encode(self, text: str, add_bos: bool = True) -> list[int]:\n        ids = [BOS_ID] if add_bos else []\n        for tok in _tokenise_text(text):\n            ids.append(self.vocab.get(tok, UNK_ID))\n        return ids\n\n    def decode(self, ids: list[int]) -> str:\n        parts = []\n        for i in ids:\n            tok = self.id2tok.get(i, \"\")\n            if tok in SPECIAL:\n                continue\n            parts.append(tok)\n        return \" \".join(parts)\n\n    @property\n    def vocab_size(self) -> int:\n        return len(self.vocab)\n\n    # ── Persistence ──────────────────────────────────────────────────────────\n    def save(self, path: str):\n        Path(path).write_text(json.dumps(self.vocab, ensure_ascii=False, indent=2))\n        print(f\"✓ Saved tokeniser → {path}  ({self.vocab_size} tokens)\")\n\n    @classmethod\n    def load(cls, path: str) -> \"SpearTokenizer\":\n        vocab = json.loads(Path(path).read_text())\n        # JSON keys are always strings; values are ints\n        vocab = {k: int(v) for k, v in vocab.items()}\n        return cls(vocab)\n", "train.py": "\"\"\"\nspear_ai/train.py\n─────────────────\nOffline training pipeline for SpearLLM.\n\nRun this ONCE (or on a schedule) to produce trained weights.\nThe server NEVER calls this — it only loads the saved checkpoint.\n\nUsage:\n  python train.py --version s --steps 4000 --out checkpoints/spear-s.pt\n  python train.py --version m --steps 6000 --out checkpoints/spear-m.pt\n\nGPU is used automatically when available (CUDA → MPS → CPU).\n\"\"\"\n\nimport argparse\nimport math\nimport os\nimport time\nfrom pathlib import Path\n\nimport torch\nimport torch.nn.functional as F\nfrom torch.optim import AdamW\n\nfrom model     import SpearLLM, SpearConfig\nfrom tokenizer import SpearTokenizer\n\n\n# ─── Training corpus (matches browser TRAINING_DATA) ─────────────────────────\nTRAINING_DATA = \"\"\"\nWhat is a variable? A named container that stores a value which can be read and changed.\nWhat is a function? A reusable block of code that performs a specific task when called.\nWhat is recursion? A function that calls itself to solve smaller instances of the same problem.\nWhat is a loop? A control structure that repeats a block of code while a condition is true.\nWhat is an array? An ordered collection of elements accessed by a numeric index starting at zero.\nWhat is a hash map? A data structure that maps keys to values using a hash function for fast lookup.\nWhat is a linked list? A sequence of nodes where each node stores data and a pointer to the next node.\nWhat is a binary tree? A tree where each node has at most two children called left and right.\nWhat is a stack? A last in first out data structure that supports push and pop operations.\nWhat is a queue? A first in first out data structure that supports enqueue and dequeue operations.\nWhat is a closure? A function that captures variables from its surrounding scope even after that scope exits.\nWhat is polymorphism? The ability of different classes to be treated as instances of the same interface.\nWhat is encapsulation? Bundling data and methods together and hiding internal details from outside code.\nWhat is an interface? A contract that defines method signatures without providing implementations.\nWhat is async programming? A way to run tasks concurrently without blocking the main thread.\nWhat is a promise? An object representing the eventual completion or failure of an asynchronous operation.\nWhat is a race condition? When two threads access shared data simultaneously causing unpredictable results.\nWhat is a deadlock? When two processes wait for each other to release resources and neither can proceed.\nWhat is garbage collection? Automatic memory management that frees objects no longer referenced by the program.\nWhat is a design pattern? A reusable solution to a commonly occurring problem in software design.\nWhat is the singleton pattern? Ensuring a class has only one instance and providing a global access point.\nWhat is the factory pattern? A method that creates objects without specifying the exact class to instantiate.\nWhat is the MVC pattern? Separating an application into Model View and Controller components.\nWhat is a REST API? An interface using HTTP methods to perform operations on resources identified by URLs.\nWhat is idempotency? An operation that produces the same result whether called once or multiple times.\nWhat is Big O notation? A way to describe how the time or space of an algorithm scales with input size.\nWhat is O of n squared? Quadratic time where the number of operations grows as the square of input size.\nWhat is O of log n? Logarithmic time where the algorithm halves the problem size at each step.\nWhat is memoization? Caching the result of a function call so repeated calls with the same input are fast.\nWhat is dynamic programming? Breaking a problem into overlapping subproblems and storing results to avoid recomputation.\nHow does quicksort work? It picks a pivot partitions the array around it and recursively sorts each partition.\nHow does merge sort work? It divides the array in half sorts each half and merges the two sorted halves.\nHow does binary search work? It checks the middle element of a sorted array and eliminates half the range each step.\nHow does a hash table handle collisions? Through chaining which uses a linked list at each bucket or open addressing.\nWhat is the difference between a process and a thread? A process has its own memory while threads share the memory of their parent process.\nWhat is virtual memory? An abstraction that gives each process the illusion of a private contiguous memory space.\nWhat is a cache? A small fast memory that stores copies of frequently accessed data to reduce retrieval time.\nWhat is a mutex? A mutual exclusion lock that ensures only one thread can access a resource at a time.\nWhat is an abstract class? A class that cannot be instantiated and may contain both abstract and concrete methods.\nWhat is dependency injection? Providing an object its dependencies from the outside rather than creating them internally.\nWhat is a pure function? A function that always returns the same output for the same input and has no side effects.\nWhat is immutability? The property of an object whose state cannot be modified after it is created.\nWhat is functional programming? A paradigm that treats computation as the evaluation of mathematical functions.\nWhat is object oriented programming? A paradigm that models software using objects that combine state and behaviour.\nWhat is type inference? When a compiler or runtime automatically deduces the type of a variable or expression.\nWhat is a generic type? A type that is parameterised by another type allowing reuse with different data types.\nWhat is an exception? An event that disrupts normal program flow and can be caught and handled by the program.\nWhat is serialization? Converting an object into a format that can be stored or transmitted and later reconstructed.\nWhat is a binary search tree? A tree where each node is greater than all nodes in its left subtree and less than those in its right.\nWhat is graph traversal? Visiting all nodes in a graph either depth first or breadth first.\nHow does depth first search work? It explores as far as possible along each branch before backtracking.\nHow does breadth first search work? It explores all neighbours at the current depth before moving to nodes at the next depth.\nWhat is a heap? A complete binary tree where each parent is greater than or equal to its children for a max heap.\nWhat is Dijkstra's algorithm? It finds the shortest path from a source node to all other nodes in a weighted graph.\nHow do you merge two sorted arrays? Use two pointers compare elements and push the smaller one advancing that pointer.\nWhat is currying? Transforming a function that takes multiple arguments into a sequence of functions each taking one.\nHow do you implement an LRU cache? Use a doubly linked list for order and a hash map for constant time lookup.\nHow do you flatten a nested array? Use flat with a depth argument or reduce with concat recursively.\nHow do you deep clone an object? Use structured clone for modern browsers or JSON parse of JSON stringify.\nWhat is time complexity? It describes how the number of operations grows as input size increases in Big O.\nWhat is space complexity? It describes how much memory an algorithm uses as input size grows.\nWhat is the difference between deep and shallow copy? Shallow copies the top level while deep recursively duplicates everything.\nWhat is a trie? A tree where each node represents a character and paths from root to leaf spell stored strings.\nWhat is the observer pattern? Subjects notify all registered observers automatically when their state changes.\nWhat is the difference between composition and inheritance? Composition assembles behaviour by combining objects while inheritance derives it from a parent.\nWhat is a higher order function? A function that takes one or more functions as arguments or returns a function.\nWhat is the difference between null and undefined? Null is an intentional absence while undefined means a variable was declared but not assigned.\nHow do you reverse a string? Split it into characters reverse the array and join it back into a string.\nHow do you find duplicates in an array? Use a set to track seen elements and collect any that appear more than once.\nWhat is event delegation? Attaching a single listener to a parent element and using event target to handle child events.\nWhat is the DOM? A tree representation of an HTML document that JavaScript can read and modify.\nWhat is a callback? A function passed as an argument to another function to be called when an operation completes.\nWhat is a stack overflow? When recursive calls exceed the maximum call stack size causing the program to crash.\nWhat is a memory leak? When objects that are no longer needed are still referenced preventing garbage collection.\nWhat is prototypal inheritance in JavaScript? Objects inherit properties directly from other objects through the prototype chain.\nWhat is strict equality? It compares both value and type avoiding implicit type coercion surprises.\nWhat is the this keyword? It refers to the execution context and its value depends on how the function is called.\nWhat is destructuring? Extracting values from arrays or properties from objects into named variables.\nWhat is the spread operator? It expands an iterable into individual elements for copying or merging collections.\nWhat is an arrow function? A concise anonymous function that inherits the surrounding this context.\nWhat is a module in JavaScript? A file with explicit exports and imports that encapsulates related functionality.\nWhat is version control? Git tracks every change to code allowing rollback collaboration and branching.\nWhat is a REST endpoint? A URL that a REST API exposes for a specific resource and HTTP method.\nWhat is CORS? A browser mechanism that blocks cross origin requests unless the server explicitly allows them.\nWhat is JWT? A compact signed token with a header payload and signature used for stateless authentication.\nWhat is the difference between authentication and authorization? Authentication verifies who you are while authorization determines what you are allowed to do.\nWhat is eventual consistency? Replicas may be temporarily out of sync but will converge to the same state given time.\nWhat is a message queue? A buffer that stores messages between services allowing asynchronous communication.\nWhat is horizontal scaling? Adding more machines to distribute load rather than making one machine more powerful.\nWhat is vertical scaling? Increasing the resources of a single machine such as adding more CPU or memory.\nWhat is a CDN? A content delivery network distributes assets across many servers to reduce latency for users.\nWhat is server side rendering? The server generates the full HTML for a page before sending it to the browser.\nWhat is client side rendering? The browser downloads JavaScript and renders the page dynamically on the client.\nWhat is a single page application? A web app that loads one HTML page and updates the DOM dynamically without full reloads.\nWhat is GraphQL? A query language for APIs that allows clients to request exactly the data they need.\nWhat is WebSockets? A protocol that provides a persistent two way communication channel over a single connection.\nWhat is OAuth? An authorization framework that lets users grant limited access to their resources to third party apps.\nWhat is a race condition in databases? When two transactions read and write the same data concurrently causing inconsistency.\nWhat is database normalization? Organizing a database to reduce redundancy and improve data integrity.\nWhat is an ORM? An object relational mapper lets you interact with a database using objects instead of SQL queries.\nWhat is lazy loading? Deferring the loading of resources until they are actually needed to improve performance.\nWhat is tree shaking? Removing unused code from a JavaScript bundle to reduce its size.\nWhat is code splitting? Dividing code into separate bundles that can be loaded on demand rather than all at once.\nWhat is continuous integration? Automatically building and testing code every time a change is pushed to a repository.\nWhat is continuous deployment? Automatically deploying code to production after it passes all tests.\nWhat is technical debt? The accumulated cost of shortcuts and poor decisions made during development.\nWhat is refactoring? Improving the internal structure of code without changing its external behaviour.\nWhat is a code review? The process of examining code written by a colleague to find bugs and improve quality.\nWhat is test driven development? Writing tests before writing the code that makes them pass.\nWhat is a unit test? A test that verifies a single function or component in isolation.\nWhat is an integration test? A test that verifies multiple components work correctly together.\nWhat is a mock? A replacement for a real dependency that lets you control its behaviour during testing.\nWhat is the difference between a library and a framework? A library is called by your code while a framework calls your code through inversion of control.\nI am SpearLLM a helpful coding assistant built on a GPT architecture.\nMy architecture uses RMSNorm for layer normalization RoPE for positional encoding and SwiGLU as the feedforward activation.\nI can explain machine learning concepts write and review code explain algorithms and help you debug programs step by step.\nAsk me to implement a data structure write a sorting algorithm explain a design pattern or analyze algorithmic complexity.\nWhen you describe a coding problem I explain the approach outline the algorithm and walk through the implementation clearly.\nI understand big O notation and can explain why one algorithm is faster or uses less memory than another.\nFor frontend questions I know React hooks state management event delegation and how the browser renders the DOM.\nFor backend questions I understand REST APIs authentication strategies caching database design and distributed systems.\nI can help you understand the difference between approaches and recommend the right tool for your specific situation.\nIf you get stuck on a problem describe it to me and I will help you work through it systematically.\n\"\"\"\n\n\n# ─── Learning-rate schedule (cosine with warmup) ──────────────────────────────\n\nWARMUP_RATIO = 0.06\n\ndef get_lr(step: int, total_steps: int, base_lr: float, min_lr: float) -> float:\n    warmup = int(total_steps * WARMUP_RATIO)\n    if step < warmup:\n        return base_lr * (step + 1) / warmup\n    progress = (step - warmup) / max(total_steps - warmup, 1)\n    return min_lr + (base_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))\n\n\nLR_DEFAULTS = {\n    \"s\":  (5e-4, 5e-5),\n    \"m\":  (2e-4, 2e-5),\n    \"l\":  (1e-4, 1e-5),\n    \"xl\": (8e-5, 8e-6),\n}\nSTEP_DEFAULTS = {\"s\": 4000, \"m\": 6000, \"l\": 10000, \"xl\": 14000}\n\n\n# ─── Data pipeline ────────────────────────────────────────────────────────────\n\ndef make_batches(\n    ids: list[int], ctx_len: int, batch_size: int, device: torch.device\n) -> list[tuple[torch.Tensor, torch.Tensor]]:\n    \"\"\"\n    Tile the token sequence into (input, target) pairs of length ctx_len.\n    Each target is the input shifted right by one.\n    \"\"\"\n    ids_t = torch.tensor(ids, dtype=torch.long)\n    total = len(ids_t)\n    seq_len = ctx_len + 1\n\n    # Trim to full sequences\n    n_seq = (total - 1) // seq_len\n    if n_seq == 0:\n        # Dataset smaller than one context — repeat it\n        repeats = math.ceil(seq_len * 2 / total)\n        ids_t = ids_t.repeat(repeats)\n        n_seq = (len(ids_t) - 1) // seq_len\n\n    chunks = ids_t[:n_seq * seq_len + 1]\n    batches = []\n    for start in range(0, n_seq * seq_len, seq_len * batch_size):\n        end = min(start + seq_len * batch_size, n_seq * seq_len)\n        seqs = []\n        for i in range(start, end, seq_len):\n            seqs.append(chunks[i:i + seq_len])\n        if len(seqs) == 0:\n            break\n        mat = torch.stack(seqs).to(device)  # (B, seq_len)\n        batches.append((mat[:, :-1], mat[:, 1:]))\n\n    return batches\n\n\n# ─── Main training loop ───────────────────────────────────────────────────────\n\ndef train(args):\n    # ── Device ───────────────────────────────────────────────────────────────\n    if torch.cuda.is_available():\n        device = torch.device(\"cuda\")\n    elif torch.backends.mps.is_available():\n        device = torch.device(\"mps\")\n    else:\n        device = torch.device(\"cpu\")\n    print(f\"✓ Device: {device}\")\n\n    # ── Tokeniser ─────────────────────────────────────────────────────────────\n    tok_path = Path(args.out).with_suffix(\".tok.json\")\n    if tok_path.exists() and not args.retrain_tokenizer:\n        tokenizer = SpearTokenizer.load(str(tok_path))\n        print(f\"✓ Loaded tokeniser from {tok_path}\")\n    else:\n        tokenizer = SpearTokenizer.from_text(TRAINING_DATA, max_vocab=4096)\n        tok_path.parent.mkdir(parents=True, exist_ok=True)\n        tokenizer.save(str(tok_path))\n\n    # ── Model ─────────────────────────────────────────────────────────────────\n    cfg   = SpearConfig.from_version(args.version)\n    cfg.vocab_size = tokenizer.vocab_size\n    model = SpearLLM(cfg).to(device)\n    print(f\"✓ SpearLLM-{args.version.upper()} | {model.param_count()} params | vocab {cfg.vocab_size}\")\n\n    # ── Data ──────────────────────────────────────────────────────────────────\n    ids      = tokenizer.encode(TRAINING_DATA, add_bos=False)\n    batches  = make_batches(ids, cfg.ctx_len, args.batch_size, device)\n    print(f\"✓ Training corpus: {len(ids)} tokens → {len(batches)} batches\")\n\n    # ── Optimiser ─────────────────────────────────────────────────────────────\n    base_lr, min_lr = LR_DEFAULTS[args.version]\n    total_steps = args.steps or STEP_DEFAULTS[args.version]\n\n    optimizer = AdamW(\n        model.parameters(),\n        lr=base_lr,\n        betas=(0.9, 0.95),\n        weight_decay=0.1,\n        eps=1e-8,\n    )\n\n    # ── Training loop ─────────────────────────────────────────────────────────\n    print(f\"\\n{'─'*60}\")\n    print(f\"  Training for {total_steps} steps\")\n    print(f\"{'─'*60}\")\n\n    model.train()\n    step       = 0\n    epoch      = 0\n    loss_accum = 0.0\n    t0         = time.time()\n\n    out_path = Path(args.out)\n    out_path.parent.mkdir(parents=True, exist_ok=True)\n\n    while step < total_steps:\n        epoch += 1\n        for x, y in batches:\n            if step >= total_steps:\n                break\n\n            # LR schedule\n            lr = get_lr(step, total_steps, base_lr, min_lr)\n            for pg in optimizer.param_groups:\n                pg[\"lr\"] = lr\n\n            optimizer.zero_grad(set_to_none=True)\n            logits = model(x)                                # (B, T, V)\n            loss   = F.cross_entropy(\n                logits.view(-1, cfg.vocab_size),\n                y.view(-1),\n                ignore_index=0,                              # ignore <pad>\n            )\n            loss.backward()\n            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n            optimizer.step()\n\n            loss_accum += loss.item()\n            step += 1\n\n            # ── Logging ───────────────────────────────────────────────────────\n            if step % args.log_every == 0:\n                avg_loss = loss_accum / args.log_every\n                elapsed  = time.time() - t0\n                steps_s  = step / elapsed\n                eta_s    = (total_steps - step) / max(steps_s, 1e-6)\n                print(\n                    f\"  step {step:>6}/{total_steps}  \"\n                    f\"loss {avg_loss:.4f}  \"\n                    f\"lr {lr:.2e}  \"\n                    f\"{steps_s:.1f} steps/s  \"\n                    f\"ETA {eta_s/60:.1f} min\"\n                )\n                loss_accum = 0.0\n\n            # ── Checkpoint ────────────────────────────────────────────────────\n            if step % args.save_every == 0 or step == total_steps:\n                model.save(str(out_path))\n\n    # ── Final save ────────────────────────────────────────────────────────────\n    model.save(str(out_path))\n    total_time = time.time() - t0\n    print(f\"\\n{'─'*60}\")\n    print(f\"  ✓ Training complete in {total_time/60:.1f} min\")\n    print(f\"  ✓ Checkpoint: {out_path}\")\n    print(f\"  ✓ Tokeniser:  {tok_path}\")\n    print(f\"{'─'*60}\\n\")\n\n\n# ─── CLI ──────────────────────────────────────────────────────────────────────\n\nif __name__ == \"__main__\":\n    parser = argparse.ArgumentParser(description=\"Train SpearLLM offline\")\n    parser.add_argument(\"--version\",   default=\"s\",                choices=[\"s\",\"m\",\"l\",\"xl\"])\n    parser.add_argument(\"--steps\",     type=int,  default=None,    help=\"Override default step count\")\n    parser.add_argument(\"--batch-size\",type=int,  default=4,       dest=\"batch_size\")\n    parser.add_argument(\"--out\",       default=\"checkpoints/spear-s.pt\")\n    parser.add_argument(\"--log-every\", type=int,  default=100,     dest=\"log_every\")\n    parser.add_argument(\"--save-every\",type=int,  default=500,     dest=\"save_every\")\n    parser.add_argument(\"--retrain-tokenizer\", action=\"store_true\", dest=\"retrain_tokenizer\")\n    args = parser.parse_args()\n\n    # Auto-set checkpoint filename to match version\n    if args.out == \"checkpoints/spear-s.pt\":\n        args.out = f\"checkpoints/spear-{args.version}.pt\"\n\n    train(args)\n", "requirements.txt": "# Spear AI — Backend Requirements\n# Install with: pip install -r requirements.txt\n\n# ── Core ──────────────────────────────────────────────────────────────────────\nfastapi>=0.111.0\nuvicorn[standard]>=0.29.0    # ASGI server (includes uvloop + httptools)\npydantic>=2.6.0\n\n# ── ML ────────────────────────────────────────────────────────────────────────\n# CPU-only PyTorch (small footprint). For CUDA replace with:\n# torch>=2.3.0  (and install the cuda index: --index-url https://download.pytorch.org/whl/cu121)\ntorch>=2.3.0\n\n# ── Optional — production hardening ──────────────────────────────────────────\n# redis>=5.0.0            # Replace in-memory session store with Redis\n# prometheus-fastapi-instrumentator  # Expose /metrics for Prometheus\n# python-jose[cryptography]  # Proper JWT auth if you need it\n", "Dockerfile": "# Dockerfile — Spear AI Server\nFROM python:3.11-slim\n\nWORKDIR /app\n\n# System deps\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n    curl \\\n && rm -rf /var/lib/apt/lists/*\n\n# Python deps\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\n\n# Source\nCOPY model.py tokenizer.py train.py server.py ./\n\n# Create checkpoints dir (bind-mounted at runtime)\nRUN mkdir -p /checkpoints\n\nEXPOSE 8000\n\nCMD [\"uvicorn\", \"server:app\", \"--host\", \"0.0.0.0\", \"--port\", \"8000\", \"--workers\", \"1\"]\n", "docker-compose.yml": "# docker-compose.yml — Spear AI Production Stack\n# ─────────────────────────────────────────────────────\n# Usage:\n#   1. Copy .env.example → .env and fill in values\n#   2. docker compose up --build\n#\n# The 'train' service runs once to produce the checkpoint.\n# The 'server' service starts after training completes.\n\nservices:\n  # ── One-off training job ────────────────────────────────────────────────────\n  train:\n    build: .\n    command: python train.py --version l --steps 10000 --out /checkpoints/spear-l.pt\n    volumes:\n      - ./checkpoints:/checkpoints   # persist weights outside container\n    environment:\n      - PYTHONUNBUFFERED=1\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              count: all\n              capabilities: [gpu]   # Remove this block if no GPU\n\n  # ── Central inference server ────────────────────────────────────────────────\n  server:\n    build: .\n    command: uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1\n    ports:\n      - \"8000:8000\"\n    volumes:\n      - ./checkpoints:/checkpoints\n    environment:\n      - SPEAR_VERSION=l\n      - SPEAR_CHECKPOINT=/checkpoints/spear-l.pt\n      - SPEAR_TOKENIZER=/checkpoints/spear-l.tok.json\n      - SPEAR_API_KEY=${SPEAR_API_KEY:-}          # set in .env to enable auth\n      - SPEAR_MAX_TOKENS=200\n      - SPEAR_TEMPERATURE=0.8\n      - SPEAR_TOP_P=0.9\n      - SPEAR_RATE_LIMIT=30\n      - PYTHONUNBUFFERED=1\n    depends_on:\n      train:\n        condition: service_completed_successfully\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"curl\", \"-f\", \"http://localhost:8000/health\"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              count: all\n              capabilities: [gpu]   # Remove if no GPU\n", "README.md": "# ⚡ Spear AI — Centralized Architecture v2.0\n\nA production-grade LLM system where **training happens once on the server** and\nall users share the same pre-trained weights.\n\n```\n╔══════════════════════════════════════════════════════════╗\n║             SPEAR AI — SYSTEM ARCHITECTURE               ║\n╠══════════════════════════════════════════════════════════╣\n║                                                          ║\n║  OFFLINE (run once)         ALWAYS RUNNING               ║\n║  ─────────────────          ───────────────              ║\n║  train.py                   server.py (FastAPI)          ║\n║    │                          │                          ║\n║    │  writes                  │  loads once at startup   ║\n║    ▼                          ▼                          ║\n║  checkpoints/               Model in memory              ║\n║  spear-s.pt  ──────────────▶  (never retrained)          ║\n║  spear-s.tok.json             │                          ║\n║                               │  POST /generate          ║\n║                               ▼                          ║\n║                         User 1 ─┐                        ║\n║                         User 2 ─┤── same weights         ║\n║                         User N ─┘                        ║\n║                                                          ║\n║  CLIENT (browser)                                        ║\n║  ─────────────────                                       ║\n║  spear-client.html                                       ║\n║    NO training code                                      ║\n║    fetch() → /generate                                   ║\n║    SSE streaming support                                 ║\n╚══════════════════════════════════════════════════════════╝\n```\n\n---\n\n## File Structure\n\n```\nspear-ai/\n├── model.py           # SpearLLM PyTorch model (RMSNorm + RoPE + SwiGLU)\n├── tokenizer.py       # Lightweight word-level tokenizer\n├── train.py           # Offline training pipeline (run ONCE)\n├── server.py          # FastAPI inference server\n├── spear-client.html  # Browser frontend (no ML code)\n├── requirements.txt\n├── Dockerfile\n└── docker-compose.yml\n```\n\n---\n\n## Quickstart (Local)\n\n### 1. Install dependencies\n\n```bash\npip install -r requirements.txt\n```\n\n### 2. Train the model (one time only)\n\n```bash\n# Small model (~26M params) — trains in ~5 min on CPU, ~30s on GPU\npython train.py --version s\n\n# Medium model (~202M params) — better responses\npython train.py --version m --steps 6000\n\n# Outputs:\n#   checkpoints/spear-s.pt          ← model weights\n#   checkpoints/spear-s.tok.json    ← vocabulary\n```\n\n### 3. Start the server\n\n```bash\nuvicorn server:app --host 0.0.0.0 --port 8000\n```\n\nYou should see:\n```\nSpearLLM-S loaded on cpu in 0.8s | 26.1M params\n```\n\n### 4. Open the client\n\nOpen `spear-client.html` in your browser. It will connect to `http://localhost:8000` automatically.\n\n---\n\n## Quickstart (Docker)\n\n```bash\n# Build and run everything (trains first, then serves)\ndocker compose up --build\n\n# Server will be available at http://localhost:8000\n```\n\n---\n\n## API Reference\n\n### `GET /health`\n\nReturns server status. No auth required.\n\n```json\n{\n  \"status\": \"ok\",\n  \"model\": \"SpearLLM-S\",\n  \"device\": \"cuda\",\n  \"params\": \"26.1M\",\n  \"uptime_s\": 142.3\n}\n```\n\n### `POST /generate`\n\nSend a prompt, receive a response.\n\n```bash\ncurl -X POST http://localhost:8000/generate \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"prompt\": \"What is a binary search tree?\"}'\n```\n\n```json\n{\n  \"response\": \"a tree where each node is greater than ...\",\n  \"session_id\": \"abc123...\",\n  \"tokens\": 48,\n  \"latency_ms\": 312,\n  \"model\": \"SpearLLM-S\"\n}\n```\n\n**Request body:**\n\n| Field         | Type    | Default  | Description                         |\n|---------------|---------|----------|-------------------------------------|\n| `prompt`      | string  | required | User message                        |\n| `session_id`  | string  | auto     | Reuse to maintain conversation context |\n| `max_tokens`  | int     | 200      | Max tokens to generate              |\n| `temperature` | float   | 0.8      | Sampling temperature (0 = greedy)   |\n| `top_p`       | float   | 0.9      | Nucleus sampling threshold          |\n| `stream`      | bool    | false    | Enable SSE streaming                |\n\n### `POST /generate` (streaming)\n\nSet `\"stream\": true` to receive a Server-Sent Events stream.\n\n```javascript\nconst res = await fetch('/generate', {\n  method: 'POST',\n  body: JSON.stringify({ prompt: 'Hello', stream: true }),\n  headers: { 'Content-Type': 'application/json' },\n});\n\nconst reader = res.body.getReader();\n// Each SSE event: data: {\"token\": \"word\", \"done\": false}\n// Final event:    data: {\"token\": \"\", \"done\": true, \"tokens\": 42}\n```\n\n### `DELETE /session/{session_id}`\n\nClear conversation history for a session.\n\n---\n\n## Environment Variables\n\n| Variable             | Default                        | Description                          |\n|----------------------|--------------------------------|--------------------------------------|\n| `SPEAR_VERSION`      | `s`                            | Model version (s/m/l/xl)            |\n| `SPEAR_CHECKPOINT`   | `checkpoints/spear-s.pt`       | Path to model weights                |\n| `SPEAR_TOKENIZER`    | `checkpoints/spear-s.tok.json` | Path to tokenizer vocab              |\n| `SPEAR_API_KEY`      | `` (disabled)                  | Set to enable API key auth           |\n| `SPEAR_MAX_TOKENS`   | `200`                          | Default max generated tokens         |\n| `SPEAR_TEMPERATURE`  | `0.8`                          | Default sampling temperature         |\n| `SPEAR_RATE_LIMIT`   | `30`                           | Max requests per minute per IP       |\n| `SPEAR_MAX_HISTORY`  | `10`                           | Conversation turns kept per session  |\n\n---\n\n## Architecture Notes\n\n### Why training is separate from serving\n\nIn the old system, every browser tab re-initialized random weights and trained\nfrom scratch. This meant:\n- Hours of training per user\n- No shared knowledge between users\n- Massive wasted compute\n\nIn the new system:\n1. `train.py` runs **once** (or on a schedule) and saves weights to disk\n2. `server.py` loads those weights **once** at startup and keeps them in RAM/VRAM\n3. Every `/generate` request is **pure inference** — the weights never change\n\n### Conversation memory without retraining\n\nMemory is implemented by prepending conversation history to the prompt before\ninference. The model sees:\n\n```\nUser: What is a linked list?\nSpearLLM: a sequence of nodes...\nUser: How does deletion work?\nSpearLLM:\n```\n\nThis is how all major LLM APIs (OpenAI, Anthropic) implement context/memory.\nNo fine-tuning required.\n\n### Scaling\n\n- **Single server, multiple users**: FastAPI handles concurrent requests via\n  asyncio. Inference runs in a thread pool so the event loop stays responsive.\n- **Multiple servers**: Put a load balancer (nginx, Caddy) in front of N server\n  instances. All share the same read-only checkpoint file.\n- **GPU**: Set `SPEAR_CHECKPOINT` and the server auto-detects CUDA/MPS.\n\n---\n\n## Production Hardening (TODO checklist)\n\n- [ ] Replace in-memory session store with Redis\n- [ ] Add proper JWT auth (`python-jose`)\n- [ ] Add Prometheus metrics (`prometheus-fastapi-instrumentator`)\n- [ ] Set up nginx reverse proxy with TLS\n- [ ] Add scheduled retraining cron job\n- [ ] Implement proper streaming `generate()` (true token-by-token, not word-split)\n- [ ] Add request logging to CloudWatch / Datadog\n"}
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─── Embedded file data ───────────────────────────────────────────────────────
+const FILES_RAW = JSON.parse(document.getElementById('files-data').textContent);
+const FILES_ORDER = ['server.py','model.py','tokenizer.py','train.py','requirements.txt','Dockerfile','docker-compose.yml','README.md'];
+const FILE_ICON = {
+  'server.py':'🖥','model.py':'🧠','tokenizer.py':'🔤','train.py':'🏋',
+  'requirements.txt':'📦','Dockerfile':'🐳','docker-compose.yml':'🐙','README.md':'📖',
+};
+const FILE_LANG = {
+  'server.py':'python','model.py':'python','tokenizer.py':'python','train.py':'python',
+  'requirements.txt':'text','Dockerfile':'dockerfile','docker-compose.yml':'yaml','README.md':'markdown',
+};
+
+// ─── Theme ────────────────────────────────────────────────────────────────────
+const T = {
+  bg0:'#0a0e14', bg1:'#0d1117', bg2:'#161b22', bg3:'#21262d',
+  border:'#21262d', border2:'#30363d',
+  text:'#e6edf3', textMid:'#8b949e', textDim:'#484f58',
+  teal:'#4dd9c0', purple:'#a78bfa', amber:'#f59e0b',
+  red:'#f87171', green:'#3fb950', blue:'#58a6ff',
+};
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+const API_BASE        = 'http://localhost:8000';
+const API_KEY         = '';
+const POLL_INTERVAL_MS = 30_000;
+
+const MODEL_INFO = {
+  s:  { label:'26M params',  color:'#4dd9c0', desc:'Fast, good for testing' },
+  m:  { label:'202M params', color:'#a78bfa', desc:'Balanced performance' },
+  l:  { label:'303M params', color:'#f59e0b', desc:'High quality' },
+  xl: { label:'403M params', color:'#f87171', desc:'Best quality, slower' },
+};
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+const rndId = () => Math.random().toString(36).slice(2,9);
+const now   = () => new Date().toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+
+function formatMessage(text) {
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  return parts.map((p, i) => {
+    if (p.startsWith('```')) {
+      const code = p.slice(3).replace(/^[a-z]*\n/, '').replace(/```$/, '').trim();
+      return <pre key={i}><code>{code}</code></pre>;
+    }
+    return <p key={i}>{p}</p>;
+  });
+}
+
+// ─── API client ───────────────────────────────────────────────────────────────
+const headers = () => ({
+  'Content-Type': 'application/json',
+  ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
+});
+
+async function apiHealth() {
+  const r = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(5000) });
+  return r.json();
+}
+
+async function apiGenerate(payload) {
+  const r = await fetch(`${API_BASE}/generate`, {
+    method: 'POST', headers: headers(),
+    body: JSON.stringify(payload), signal: AbortSignal.timeout(60_000),
+  });
+  if (!r.ok) { const err = await r.json().catch(() => ({ detail: r.statusText })); throw new Error(err.detail || `HTTP ${r.status}`); }
+  return r.json();
+}
+
+async function apiGenerateStream(payload, onToken, onDone) {
+  const r = await fetch(`${API_BASE}/generate`, {
+    method: 'POST', headers: headers(),
+    body: JSON.stringify({ ...payload, stream: true }), signal: AbortSignal.timeout(60_000),
+  });
+  if (!r.ok) { const err = await r.json().catch(() => ({ detail: r.statusText })); throw new Error(err.detail || `HTTP ${r.status}`); }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      try {
+        const ev = JSON.parse(line.slice(5).trim());
+        if (ev.error) throw new Error(ev.error);
+        if (ev.done) { onDone(ev.tokens); return; }
+        onToken(ev.token);
+      } catch (e) { if (e.message !== 'JSON parse failed') throw e; }
+    }
+  }
+}
+
+async function apiClearSession(sessionId) {
+  await fetch(`${API_BASE}/session/${sessionId}`, { method: 'DELETE', headers: headers() });
+}
+
+// ─── Syntax highlighter (simple token-based) ──────────────────────────────────
+function highlight(code, lang) {
+  if (lang === 'markdown') {
+    return code.split('\n').map((line, i) => {
+      let color = T.text;
+      if (line.startsWith('#')) color = T.teal;
+      else if (line.startsWith('```')) color = T.textDim;
+      else if (line.startsWith('- ') || line.startsWith('* ')) color = T.textMid;
+      else if (line.startsWith('|')) color = T.purple;
+      return <span key={i} style={{ color, display:'block' }}>{line || '\u00a0'}</span>;
+    });
+  }
+  if (lang === 'yaml') {
+    return code.split('\n').map((line, i) => {
+      let el;
+      const m = line.match(/^(\s*)([\w-]+)(:)(.*)/);
+      if (m) {
+        el = <><span style={{ color:T.textDim }}>{m[1]}</span><span style={{ color:T.teal }}>{m[2]}</span><span style={{ color:T.textMid }}>{m[3]}</span><span style={{ color:T.text }}>{m[4]}</span></>;
+      } else if (line.trim().startsWith('#')) {
+        el = <span style={{ color:T.textDim }}>{line}</span>;
+      } else {
+        el = <span style={{ color:T.text }}>{line}</span>;
+      }
+      return <span key={i} style={{ display:'block' }}>{el || '\u00a0'}</span>;
+    });
+  }
+  // Python / Dockerfile / text — basic keyword colorizer
+  const PY_KW = new Set(['def','class','import','from','return','if','else','elif','for','while','try','except','with','as','async','await','not','and','or','in','is','None','True','False','pass','raise','yield','lambda','self','cls']);
+  return code.split('\n').map((line, i) => {
+    if (line.trim().startsWith('#')) {
+      return <span key={i} style={{ color:T.textDim, display:'block' }}>{line || '\u00a0'}</span>;
+    }
+    // Tokenise line
+    const tokens = line.split(/(\s+|"[^"]*"|'[^']*'|\b\w+\b|[^\w\s])/g).filter(Boolean);
+    const els = tokens.map((tok, j) => {
+      if (PY_KW.has(tok)) return <span key={j} style={{ color:T.purple }}>{tok}</span>;
+      if (/^["']/.test(tok)) return <span key={j} style={{ color:T.amber }}>{tok}</span>;
+      if (/^\d+(\.\d+)?$/.test(tok)) return <span key={j} style={{ color:T.green }}>{tok}</span>;
+      if (/^[A-Z][A-Z0-9_]{2,}$/.test(tok)) return <span key={j} style={{ color:T.amber }}>{tok}</span>;
+      if (/^[a-z_]\w*\($/.test(tok + '(') && j < tokens.length - 1 && tokens[j+1] === '(') return <span key={j} style={{ color:T.blue }}>{tok}</span>;
+      return <span key={j} style={{ color:T.text }}>{tok}</span>;
+    });
+    return <span key={i} style={{ display:'block' }}>{els.length ? els : '\u00a0'}</span>;
+  });
+}
+
+// ─── File Viewer ──────────────────────────────────────────────────────────────
+function FileViewer({ filename }) {
+  const code = FILES_RAW[filename] || '';
+  const lang = FILE_LANG[filename] || 'text';
+  const lines = code.split('\n');
+
+  const download = () => {
+    const blob = new Blob([code], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+  };
+
+  const highlighted = useMemo(() => highlight(code, lang), [code, lang]);
+
+  return (
+    <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+      {/* File header */}
+      <div style={{ padding:'8px 16px', borderBottom:`1px solid ${T.border}`, display:'flex',
+                    alignItems:'center', gap:10, flexShrink:0, background:T.bg1 }}>
+        <span style={{ fontSize:16 }}>{FILE_ICON[filename]}</span>
+        <span style={{ fontSize:12, color:T.text, fontWeight:600 }}>{filename}</span>
+        <span style={{ fontSize:10, color:T.textDim, background:T.bg3, padding:'2px 7px', borderRadius:4 }}>{lang}</span>
+        <span style={{ fontSize:10, color:T.textDim, marginLeft:'auto' }}>{lines.length} lines</span>
+        <button onClick={download} style={{
+          padding:'4px 10px', background:T.bg3, border:`1px solid ${T.border2}`,
+          color:T.textMid, borderRadius:5, fontSize:11, fontFamily:'inherit',
+        }}>⬇ Download</button>
+      </div>
+      {/* Code */}
+      <div style={{ flex:1, overflowY:'auto', padding:'12px 0', background:T.bg0 }}>
+        <div className="file-code" style={{ paddingRight:16 }}>
+          {lines.map((_, i) => (
+            <div key={i} style={{ display:'flex', paddingLeft:8 }}>
+              <span className="line-num">{i+1}</span>
+              <span style={{ flex:1 }}>{highlighted[i]}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Files Panel ──────────────────────────────────────────────────────────────
+function FilesPanel() {
+  const [activeFile, setActiveFile] = useState('server.py');
+
+  const downloadAll = () => {
+    FILES_ORDER.forEach((name, idx) => {
+      setTimeout(() => {
+        const blob = new Blob([FILES_RAW[name]], { type: 'text/plain' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        a.click();
+      }, idx * 150);
+    });
+  };
+
+  return (
+    <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+      {/* Header */}
+      <div style={{ padding:'10px 16px', borderBottom:`1px solid ${T.border}`, flexShrink:0,
+                    display:'flex', alignItems:'center', gap:10 }}>
+        <span style={{ fontSize:12, color:T.teal, fontWeight:600 }}>📁 Backend Files</span>
+        <span style={{ fontSize:10, color:T.textDim }}>— {FILES_ORDER.length} files embedded</span>
+        <button onClick={downloadAll} style={{
+          marginLeft:'auto', padding:'4px 10px', background:T.teal+'18',
+          border:`1px solid ${T.teal+'44'}`, color:T.teal, borderRadius:5, fontSize:11, fontFamily:'inherit',
+        }}>⬇ Download All</button>
+      </div>
+
+      <div style={{ flex:1, display:'flex', overflow:'hidden' }}>
+        {/* File list */}
+        <div style={{ width:180, borderRight:`1px solid ${T.border}`, overflowY:'auto',
+                      background:T.bg1, flexShrink:0 }}>
+          {FILES_ORDER.map(name => (
+            <button key={name} onClick={() => setActiveFile(name)} style={{
+              width:'100%', textAlign:'left', padding:'8px 12px',
+              background: activeFile===name ? T.teal+'18' : 'transparent',
+              borderLeft: activeFile===name ? `2px solid ${T.teal}` : '2px solid transparent',
+              border:'none', borderTop:`1px solid ${T.border}`,
+              color: activeFile===name ? T.teal : T.textMid,
+              fontSize:11, fontFamily:'inherit', display:'flex', alignItems:'center', gap:7,
+              cursor:'pointer',
+            }}>
+              <span>{FILE_ICON[name]}</span>
+              <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{name}</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Code viewer */}
+        <FileViewer filename={activeFile} />
+      </div>
+    </div>
+  );
+}
+
+// ─── Server status badge ──────────────────────────────────────────────────────
+function ServerBadge({ status, info }) {
+  const colors = { ok:'#3fb950', no_model:'#f59e0b', offline:'#f87171', checking:'#8b949e' };
+  const labels = { ok:'Server online', no_model:'No model loaded', offline:'Server offline', checking:'Connecting…' };
+  const c = colors[status] || colors.checking;
+  return (
+    <div className="server-tag" style={{ display:'flex', alignItems:'center', gap:6, fontSize:11, color:c }}>
+      <span style={{ width:6, height:6, borderRadius:'50%', background:c, display:'inline-block',
+                     boxShadow: status==='ok' ? `0 0 6px ${c}88` : 'none' }} />
+      <span>{labels[status] || 'Unknown'}</span>
+      {info && <span style={{ color:T.textDim }}>· {info}</span>}
+    </div>
+  );
+}
+
+// ─── Message bubble ───────────────────────────────────────────────────────────
+function MessageBubble({ msg }) {
+  const isUser  = msg.role === 'user';
+  const isError = msg.type === 'error';
+  const isSys   = msg.role === 'system';
+
+  if (isSys) return (
+    <div style={{ padding:'6px 20px', display:'flex', justifyContent:'center' }}>
+      <span style={{ fontSize:11, color: isError ? T.red : T.textDim,
+                     background: isError ? T.red+'11' : 'transparent',
+                     padding: isError ? '4px 10px' : 0, borderRadius:4 }}>
+        {msg.content}
+      </span>
+    </div>
+  );
+
+  return (
+    <div className="msg-enter" style={{ padding:'12px 20px', display:'flex', gap:12,
+                                        flexDirection: isUser ? 'row-reverse' : 'row' }}>
+      <div style={{ width:30, height:30, borderRadius:7, flexShrink:0, display:'flex',
+                    alignItems:'center', justifyContent:'center', fontSize:13,
+                    background: isUser ? T.blue+'22' : T.teal+'22',
+                    border: `1px solid ${isUser ? T.blue+'44' : T.teal+'44'}`,
+                    color: isUser ? T.blue : T.teal }}>
+        {isUser ? '▲' : '⚡'}
+      </div>
+      <div style={{ maxWidth:'72%', display:'flex', flexDirection:'column',
+                    alignItems: isUser ? 'flex-end' : 'flex-start' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:4,
+                      flexDirection: isUser ? 'row-reverse' : 'row' }}>
+          <span style={{ fontSize:11, fontWeight:600, color: isUser ? T.blue : T.teal }}>
+            {isUser ? 'You' : 'SpearLLM'}
+          </span>
+          <span style={{ fontSize:10, color:T.textDim }}>{msg.time}</span>
+          {msg.latency && <span style={{ fontSize:10, color:T.textDim }}>· {msg.latency}ms</span>}
+        </div>
+        <div className="msg-body" style={{
+          background:   isUser ? T.blue+'12' : T.bg2,
+          border:       `1px solid ${isUser ? T.blue+'30' : T.border}`,
+          borderRadius: isUser ? '12px 3px 12px 12px' : '3px 12px 12px 12px',
+          padding:      '10px 14px', fontSize:13, lineHeight:1.65, color:T.text, wordBreak:'break-word',
+        }}>
+          {msg.streaming
+            ? <span>{msg.content}<span style={{ animation:'blink-caret 0.8s step-end infinite', marginLeft:1, borderRight:`2px solid ${T.teal}` }}>&nbsp;</span></span>
+            : formatMessage(msg.content)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TypingIndicator() {
+  return (
+    <div style={{ padding:'10px 20px', display:'flex', gap:12, alignItems:'center' }}>
+      <div style={{ width:30, height:30, borderRadius:7, background:T.teal+'22', border:`1px solid ${T.teal+'44'}`,
+                    display:'flex', alignItems:'center', justifyContent:'center', fontSize:13, color:T.teal }}>⚡</div>
+      <div style={{ display:'flex', gap:5, alignItems:'center', background:T.bg2, border:`1px solid ${T.border}`,
+                    borderRadius:'3px 12px 12px 12px', padding:'10px 16px' }}>
+        <span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
+      </div>
+    </div>
+  );
+}
+
+function InputBar({ onSend, busy }) {
+  const [text, setText] = useState('');
+  const ref = useRef(null);
+
+  const submit = () => {
+    const t = text.trim();
+    if (!t || busy) return;
+    setText('');
+    ref.current.style.height = 'auto';
+    onSend(t);
+  };
+
+  const onKey = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } };
+  const onInput = (e) => {
+    setText(e.target.value);
+    ref.current.style.height = 'auto';
+    ref.current.style.height = Math.min(ref.current.scrollHeight, 160) + 'px';
+  };
+
+  return (
+    <div style={{ padding:'12px 16px 16px', borderTop:`1px solid ${T.border}`, background:T.bg1 }}>
+      <div style={{ display:'flex', gap:8, alignItems:'flex-end', background:T.bg2,
+                    border:`1px solid ${busy ? T.teal+'44' : T.border2}`, borderRadius:10,
+                    padding:'8px 8px 8px 14px', transition:'border-color .2s',
+                    boxShadow: busy ? `0 0 0 1px ${T.teal}22` : 'none' }}>
+        <textarea ref={ref} value={text} onChange={onInput} onKeyDown={onKey}
+          placeholder="Ask SpearLLM anything about code…" disabled={busy} rows={1}
+          style={{ flex:1, background:'transparent', border:'none', color:T.text, resize:'none',
+                   fontSize:13, lineHeight:1.6, fontFamily:'inherit', maxHeight:160, opacity: busy ? .5 : 1 }} />
+        <button onClick={submit} disabled={busy || !text.trim()} style={{
+          width:34, height:34, borderRadius:7, border:'none', flexShrink:0,
+          background: (busy || !text.trim()) ? T.bg3 : T.teal,
+          color: (busy || !text.trim()) ? T.textDim : T.bg0,
+          display:'flex', alignItems:'center', justifyContent:'center',
+          transition:'all .15s', fontSize:14, fontWeight:700,
+        }}>
+          {busy
+            ? <span style={{ width:14, height:14, border:`2px solid ${T.textDim}44`, borderTopColor:T.textDim,
+                             borderRadius:'50%', animation:'spin .7s linear infinite', display:'block' }} />
+            : '↑'}
+        </button>
+      </div>
+      <div style={{ marginTop:6, paddingLeft:2, fontSize:10, color:T.textDim }}>
+        Enter to send · Shift+Enter for newline
+      </div>
+    </div>
+  );
+}
+
+function SettingsPanel({ serverUrl, setServerUrl, apiKey, setApiKey, useStream, setUseStream, onClose }) {
+  const [localUrl, setLocalUrl] = useState(serverUrl);
+  const [localKey, setLocalKey] = useState(apiKey);
+  const save = () => { setServerUrl(localUrl.replace(/\/$/, '')); setApiKey(localKey); onClose(); };
+  const inputStyle = {
+    width:'100%', background:T.bg3, border:`1px solid ${T.border2}`, color:T.text,
+    borderRadius:6, padding:'8px 10px', fontSize:12, fontFamily:'inherit', marginTop:4,
+  };
+  return (
+    <div style={{ flex:1, overflowY:'auto', padding:20, display:'flex', flexDirection:'column', gap:18 }}>
+      <div style={{ fontSize:13, fontWeight:600, color:T.teal }}>⚙ Connection Settings</div>
+      <div>
+        <label style={{ fontSize:11, color:T.textMid, display:'block' }}>Server URL</label>
+        <input value={localUrl} onChange={e=>setLocalUrl(e.target.value)} style={inputStyle}
+               placeholder="http://localhost:8000" />
+        <div style={{ fontSize:10, color:T.textDim, marginTop:4 }}>Point this at your SpearLLM server</div>
+      </div>
+      <div>
+        <label style={{ fontSize:11, color:T.textMid, display:'block' }}>API Key (optional)</label>
+        <input value={localKey} onChange={e=>setLocalKey(e.target.value)} type="password" style={inputStyle}
+               placeholder="Leave blank if auth is disabled" />
+      </div>
+      <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+        <button onClick={() => setUseStream(!useStream)} style={{
+          width:34, height:20, borderRadius:10, border:'none', position:'relative',
+          background: useStream ? T.teal : T.bg3, transition:'background .2s', cursor:'pointer' }}>
+          <span style={{ position:'absolute', top:3, left: useStream ? 17 : 3, width:14, height:14,
+                         borderRadius:'50%', background:'white', transition:'left .2s' }} />
+        </button>
+        <span style={{ fontSize:12, color:T.textMid }}>Streaming responses</span>
+      </div>
+      <div style={{ background:T.bg3, border:`1px solid ${T.border}`, borderRadius:8, padding:12 }}>
+        <div style={{ fontSize:11, color:T.textMid, marginBottom:8 }}>Quick Start — Large model (303M)</div>
+        {[
+          '# 1. Install dependencies',
+          'pip install -r requirements.txt',
+          '',
+          '# 2. Train the model (once)',
+          'python train.py --version l',
+          '',
+          '# 3. Start the server',
+          'SPEAR_VERSION=l uvicorn server:app --port 8000',
+        ].map((line, i) => (
+          <div key={i} style={{ fontSize:11, color: line.startsWith('#') ? T.amber : T.textMid,
+                                 fontFamily:'inherit', lineHeight:1.7 }}>{line || '\u00A0'}</div>
+        ))}
+      </div>
+      <button onClick={save} style={{ padding:'9px 18px', background:T.teal, color:T.bg0,
+                                       border:'none', borderRadius:7, fontSize:12, fontWeight:700,
+                                       fontFamily:'inherit', marginTop:'auto' }}>
+        Save Settings
+      </button>
+    </div>
+  );
+}
+
+// ─── Sidebar ──────────────────────────────────────────────────────────────────
+function Sidebar({ panel, setPanel, serverStatus, serverInfo, sessionId, onNewChat }) {
+  const navItems = [
+    ['chat',     '💬', 'Chat'],
+    ['files',    '📁', 'Files'],
+    ['settings', '⚙',  'Settings'],
+  ];
+  return (
+    <div style={{ width:210, background:T.bg1, borderRight:`1px solid ${T.border}`,
+                  display:'flex', flexDirection:'column', flexShrink:0 }}>
+      <div style={{ padding:'14px 16px 12px', borderBottom:`1px solid ${T.border}` }}>
+        <div style={{ fontSize:15, fontWeight:700, color:T.teal, letterSpacing:'-.02em' }}>⚡ spear code</div>
+        <div style={{ fontSize:10, color:T.textDim, marginTop:2 }}>centralized inference v2.0</div>
+      </div>
+      <div style={{ padding:'10px 14px', borderBottom:`1px solid ${T.border}` }}>
+        <ServerBadge status={serverStatus} info={serverInfo} />
+      </div>
+      <nav style={{ padding:'8px 8px 0' }}>
+        {navItems.map(([id, icon, label]) => (
+          <button key={id} onClick={() => setPanel(id)} style={{
+            width:'100%', textAlign:'left', padding:'7px 12px', borderRadius:6, border:'none',
+            background: panel===id ? T.teal+'18' : 'transparent',
+            color:      panel===id ? T.teal       : T.textMid,
+            fontSize:12, display:'flex', alignItems:'center', gap:8,
+            fontFamily:'inherit', marginBottom:2,
+          }}>
+            <span style={{ fontSize:14 }}>{icon}</span>{label}
+          </button>
+        ))}
+      </nav>
+
+      {/* Model badge — large */}
+      <div style={{ margin:'12px 10px 0', padding:10, background:T.bg2, border:`1px solid ${T.amber+'44'}`,
+                    borderRadius:7 }}>
+        <div style={{ fontSize:10, color:T.amber, marginBottom:4, fontWeight:600 }}>Default Model · Large</div>
+        {[
+          ['Size', '303M params'],
+          ['Layers', '24'],
+          ['Heads', '16'],
+          ['d_model', '1024'],
+          ['ctx_len', '128'],
+        ].map(([k,v]) => (
+          <div key={k} style={{ display:'flex', justifyContent:'space-between', fontSize:10,
+                                 color:T.textDim, marginBottom:2 }}>
+            <span>{k}</span><span style={{ color:T.textMid }}>{v}</span>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ marginTop:'auto', padding:10 }}>
+        <button onClick={onNewChat} style={{
+          width:'100%', padding:'8px 0', borderRadius:6, border:`1px solid ${T.border2}`,
+          background:'transparent', color:T.textMid, fontSize:11, fontFamily:'inherit',
+        }}>+ New Chat</button>
+        <div style={{ marginTop:8, fontSize:10, color:T.textDim, paddingLeft:2 }}>
+          Session: {sessionId.slice(0,8)}…
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatusBar({ serverStatus, modelInfo, turns, latency }) {
+  const dots = [
+    serverStatus==='ok' ? `Model: ${modelInfo||'SpearLLM-L'}` : 'No model',
+    `Turns: ${turns}`,
+    latency ? `Last: ${latency}ms` : null,
+  ].filter(Boolean);
+  return (
+    <div style={{ height:24, background:T.bg1, borderTop:`1px solid ${T.border}`,
+                  display:'flex', alignItems:'center', padding:'0 16px', gap:16, flexShrink:0 }}>
+      {dots.map((d, i) => <span key={i} style={{ fontSize:10, color:T.textDim }}>{d}</span>)}
+      <span style={{ marginLeft:'auto', fontSize:10, color:T.textDim }}>{API_BASE}</span>
+    </div>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+function SpearCode() {
+  const [serverUrl, setServerUrl] = useState(() => localStorage.getItem('spear_url')  || API_BASE);
+  const [apiKeyVal, setApiKeyVal] = useState(() => localStorage.getItem('spear_key')  || API_KEY);
+  const [useStream, setUseStream] = useState(() => localStorage.getItem('spear_stream') !== 'false');
+
+  useEffect(() => { localStorage.setItem('spear_url',    serverUrl); }, [serverUrl]);
+  useEffect(() => { localStorage.setItem('spear_key',    apiKeyVal); }, [apiKeyVal]);
+  useEffect(() => { localStorage.setItem('spear_stream', String(useStream)); }, [useStream]);
+
+  const [panel,       setPanel]       = useState('chat');
+  const [messages,    setMessages]    = useState([{
+    id: rndId(), role:'system', type:'info',
+    content:'Connected to SpearLLM-L (303M). Type a message to begin.',
+  }]);
+  const [busy,        setBusy]        = useState(false);
+  const [sessionId,   setSessionId]   = useState(() => rndId() + rndId());
+  const [turns,       setTurns]       = useState(0);
+  const [lastLatency, setLastLatency] = useState(null);
+
+  const [serverStatus, setServerStatus] = useState('checking');
+  const [serverInfo,   setServerInfo]   = useState(null);
+  const [modelVersion, setModelVersion] = useState(null);
+
+  const checkHealth = useCallback(async () => {
+    try {
+      const data = await apiHealth();
+      setServerStatus(data.status);
+      setModelVersion(data.model);
+      setServerInfo(data.model ? `${data.params}` : null);
+    } catch {
+      setServerStatus('offline');
+      setServerInfo(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkHealth();
+    const id = setInterval(checkHealth, POLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [checkHealth, serverUrl]);
+
+  const bottomRef = useRef(null);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages]);
+
+  const handleSend = useCallback(async (prompt) => {
+    if (busy) return;
+    setBusy(true);
+    const userMsg = { id:rndId(), role:'user', content:prompt, time:now() };
+    const streamId = rndId();
+    setMessages(prev => [...prev, userMsg]);
+    const t0 = Date.now();
+
+    if (useStream) {
+      setMessages(prev => [...prev, { id:streamId, role:'assistant', content:'', streaming:true, time:now() }]);
+      try {
+        await apiGenerateStream(
+          { prompt, session_id: sessionId, max_tokens: 200, temperature: 0.8, top_p: 0.9 },
+          (token) => setMessages(prev => prev.map(m => m.id===streamId ? { ...m, content:m.content+token } : m)),
+          (tokenCount) => {
+            const lat = Date.now() - t0;
+            setLastLatency(lat);
+            setMessages(prev => prev.map(m => m.id===streamId ? { ...m, streaming:false, latency:lat } : m));
+          }
+        );
+      } catch (e) {
+        setMessages(prev => prev.map(m => m.id===streamId
+          ? { id:m.id, role:'system', type:'error', content:`Error: ${e.message}`, time:m.time } : m));
+      }
+    } else {
+      setMessages(prev => [...prev, { id:streamId, role:'assistant', content:'', streaming:true, time:now() }]);
+      try {
+        const data = await apiGenerate({ prompt, session_id: sessionId, max_tokens: 200, temperature: 0.8, top_p: 0.9 });
+        const lat = Date.now() - t0;
+        setLastLatency(lat);
+        setMessages(prev => prev.map(m => m.id===streamId ? { ...m, content:data.response, streaming:false, latency:lat } : m));
+      } catch (e) {
+        setMessages(prev => prev.map(m => m.id===streamId
+          ? { id:m.id, role:'system', type:'error', content:`Error: ${e.message}`, time:m.time } : m));
+      }
+    }
+    setTurns(t => t + 1);
+    setBusy(false);
+  }, [busy, sessionId, useStream]);
+
+  const handleNewChat = useCallback(async () => {
+    await apiClearSession(sessionId).catch(() => {});
+    const newSid = rndId() + rndId();
+    setSessionId(newSid);
+    setTurns(0);
+    setMessages([{ id:rndId(), role:'system', type:'info', content:'New conversation started.' }]);
+  }, [sessionId]);
+
+  return (
+    <div style={{ display:'flex', height:'100vh', background:T.bg0, color:T.text,
+                  fontFamily:"'JetBrains Mono', monospace", overflow:'hidden' }}>
+
+      <Sidebar panel={panel} setPanel={setPanel}
+        serverStatus={serverStatus} serverInfo={serverInfo}
+        sessionId={sessionId} onNewChat={handleNewChat} />
+
+      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+
+        {panel === 'chat' && (
+          <>
+            <div style={{ padding:'10px 20px', borderBottom:`1px solid ${T.border}`,
+                          display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
+              <span style={{ fontSize:12, color:T.teal, fontWeight:600 }}>💬 Chat</span>
+              {serverStatus !== 'ok' && (
+                <span style={{ fontSize:11, color:T.amber, marginLeft:'auto' }}>
+                  ⚠ Server {serverStatus} — check Settings
+                </span>
+              )}
+              {serverStatus === 'ok' && modelVersion && (
+                <span style={{ fontSize:11, color:T.textDim, marginLeft:'auto' }}>{modelVersion}</span>
+              )}
+            </div>
+            <div style={{ flex:1, overflowY:'auto', paddingBottom:4 }}>
+              {messages.map(m => <MessageBubble key={m.id} msg={m} />)}
+              {busy && !messages.find(m => m.streaming) && <TypingIndicator />}
+              <div ref={bottomRef} />
+            </div>
+            <InputBar onSend={handleSend} busy={busy} />
+          </>
+        )}
+
+        {panel === 'files' && <FilesPanel />}
+
+        {panel === 'settings' && (
+          <>
+            <div style={{ padding:'10px 20px', borderBottom:`1px solid ${T.border}`, flexShrink:0 }}>
+              <span style={{ fontSize:12, color:T.teal, fontWeight:600 }}>⚙ Settings</span>
+            </div>
+            <SettingsPanel serverUrl={serverUrl} setServerUrl={setServerUrl}
+              apiKey={apiKeyVal} setApiKey={setApiKeyVal}
+              useStream={useStream} setUseStream={setUseStream}
+              onClose={() => setPanel('chat')} />
+          </>
+        )}
+
+      </div>
+
+      <StatusBar serverStatus={serverStatus} modelInfo={modelVersion} turns={turns} latency={lastLatency} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(SpearCode));
+</script>
+</body>
+</html>
